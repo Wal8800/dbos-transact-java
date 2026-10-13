@@ -35,6 +35,7 @@ import dev.dbos.transact.workflow.internal.InternalWorkflows;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.sql.Connection;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
@@ -563,6 +564,56 @@ public class DBOS implements AutoCloseable {
       @Nullable Map<String, Object> namedArgs) {
     return ensureLaunched("enqueueWorkflow")
         .enqueueWorkflowByName(options, positionalArgs, namedArgs);
+  }
+
+  /**
+   * Enqueue a workflow by name in a transaction the caller owns, so it commits or rolls back with
+   * the caller's own writes. Otherwise as {@link #enqueueWorkflow(EnqueueOptions, Object[])}.
+   *
+   * <p>{@code connection} must reach this application's system database with a transaction open,
+   * such as a connection enlisted in a JTA or Spring transaction. DBOS never commits, rolls back or
+   * retries on it, so the workflow exists only once the caller commits.
+   *
+   * <p>A failed enqueue, such as a deduplication clash, aborts a Postgres transaction: roll it back
+   * rather than retry on it. Enqueueing an existing workflow ID returns its handle and locks its
+   * row until the caller's transaction ends.
+   *
+   * @param <T> Return type of the workflow
+   * @param <E> Type of checked exception thrown by the workflow, if any
+   * @param connection A connection to the system database, with a transaction open
+   * @param options Options describing the workflow to enqueue
+   * @param args Positional arguments to pass to the workflow function
+   * @return A handle to the enqueued workflow, valid once the caller commits
+   * @throws IllegalArgumentException if {@code connection} is in autocommit mode
+   * @throws IllegalStateException if called from inside a workflow or step
+   */
+  public <T, E extends Exception> @NonNull WorkflowHandle<T, E> enqueueWorkflowInTransaction(
+      @NonNull Connection connection, @NonNull EnqueueOptions options, @Nullable Object[] args) {
+    return enqueueWorkflowInTransaction(connection, options, args, null);
+  }
+
+  /**
+   * As {@link #enqueueWorkflowInTransaction(Connection, EnqueueOptions, Object[])}, with named as
+   * well as positional arguments.
+   *
+   * @param <T> Return type of the workflow
+   * @param <E> Type of checked exception thrown by the workflow, if any
+   * @param connection A connection to the system database, with a transaction open
+   * @param options Options describing the workflow to enqueue
+   * @param positionalArgs Positional arguments to pass to the workflow function
+   * @param namedArgs Named arguments to pass to the workflow function (e.g. Python kwargs)
+   * @return A handle to the enqueued workflow, valid once the caller commits
+   * @throws IllegalArgumentException if {@code connection} is in autocommit mode
+   * @throws IllegalStateException if called from inside a workflow or step
+   */
+  public <T, E extends Exception> @NonNull WorkflowHandle<T, E> enqueueWorkflowInTransaction(
+      @NonNull Connection connection,
+      @NonNull EnqueueOptions options,
+      @Nullable Object[] positionalArgs,
+      @Nullable Map<String, Object> namedArgs) {
+    Objects.requireNonNull(connection, "connection must not be null");
+    return ensureLaunched("enqueueWorkflowInTransaction")
+        .enqueueWorkflowByName(options, positionalArgs, namedArgs, connection);
   }
 
   /**

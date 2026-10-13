@@ -64,6 +64,7 @@ import dev.dbos.transact.workflow.internal.WorkflowStatusInternal;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -1974,13 +1975,31 @@ public class DBOSExecutor implements AutoCloseable {
    * caller gives one. An unset version is only dequeued by an executor running the owning
    * application's latest registered version.
    */
-  @SuppressWarnings("removal") // honors the deprecated deadline option
   public <T, E extends Exception> WorkflowHandle<T, E> enqueueWorkflowByName(
       EnqueueOptions options, Object[] positionalArgs, Map<String, Object> namedArgs) {
+    return enqueueWorkflowByName(options, positionalArgs, namedArgs, null);
+  }
+
+  /**
+   * As {@link #enqueueWorkflowByName(EnqueueOptions, Object[], Map)}, but a non-null {@code
+   * connection} writes the workflow in the caller's transaction.
+   */
+  @SuppressWarnings("removal") // honors the deprecated deadline option
+  public <T, E extends Exception> WorkflowHandle<T, E> enqueueWorkflowByName(
+      EnqueueOptions options,
+      Object[] positionalArgs,
+      Map<String, Object> namedArgs,
+      @Nullable Connection connection) {
 
     Objects.requireNonNull(options, "options must not be null");
 
     var ctx = DBOSContextHolder.get();
+    // A workflow's checkpoint of this enqueue commits on DBOS's own connection, apart from the
+    // caller's transaction. Checked before getParent takes a function ID.
+    if (connection != null && ctx.isInWorkflow()) {
+      throw new IllegalStateException(
+          "cannot enqueue a workflow in a caller-owned transaction from inside a workflow");
+    }
     // Throws if called from a step, and takes the caller's next function ID when in a workflow.
     var parent = getParent(ctx);
     // In a workflow the derived ID makes a crash-replay collide with the original enqueue rather
@@ -2034,7 +2053,8 @@ public class DBOSExecutor implements AutoCloseable {
         executorId(),
         appId(),
         options.applicationName(),
-        systemDatabase);
+        systemDatabase,
+        connection);
 
     return new WorkflowHandleDBPoll<>(this, workflowId);
   }
@@ -2312,7 +2332,8 @@ public class DBOSExecutor implements AutoCloseable {
               appId(),
               parent,
               options,
-              null); // applicationName: this executor's own
+              null, // applicationName: this executor's own
+              null);
     }
     if (!initResult.shouldExecuteOnThisExecutor()) {
       return retrieveWorkflow(workflowId);
@@ -2481,6 +2502,37 @@ public class DBOSExecutor implements AutoCloseable {
       String appId,
       @Nullable String applicationName,
       SystemDatabase systemDatabase) {
+    enqueueWorkflow(
+        workflowName,
+        className,
+        instanceName,
+        maxRetries,
+        positionalArgs,
+        namedArgs,
+        options,
+        parent,
+        executorId,
+        appId,
+        applicationName,
+        systemDatabase,
+        null);
+  }
+
+  // A non-null connection persists the workflow in the caller's transaction
+  public static void enqueueWorkflow(
+      String workflowName,
+      String className,
+      String instanceName,
+      Integer maxRetries,
+      Object[] positionalArgs,
+      Map<String, Object> namedArgs,
+      ExecutionOptions options,
+      WorkflowInfo parent,
+      String executorId,
+      String appId,
+      @Nullable String applicationName,
+      SystemDatabase systemDatabase,
+      @Nullable Connection connection) {
 
     if (Objects.requireNonNull(options.workflowId(), "workflowId must not be null").isEmpty()) {
       throw new IllegalArgumentException("workflowId cannot be empty");
@@ -2513,7 +2565,8 @@ public class DBOSExecutor implements AutoCloseable {
           appId,
           parent,
           options,
-          applicationName);
+          applicationName,
+          connection);
     } catch (DBOSWorkflowExecutionConflictException e) {
       logger.debug("Workflow execution conflict for workflowId {}", options.workflowId());
     } catch (DBOSQueueDuplicatedException e) {
@@ -2542,7 +2595,8 @@ public class DBOSExecutor implements AutoCloseable {
       String appId,
       WorkflowInfo parentWorkflow,
       ExecutionOptions options,
-      @Nullable String applicationName) {
+      @Nullable String applicationName,
+      @Nullable Connection connection) {
 
     var workflowStatusInternal =
         workflowStatus(
@@ -2559,7 +2613,10 @@ public class DBOSExecutor implements AutoCloseable {
             applicationName);
     var startTime = System.currentTimeMillis();
     final int retries = maxRetries == null ? Constants.DEFAULT_MAX_RECOVERY_ATTEMPTS : maxRetries;
-    var initResult = systemDatabase.initWorkflowStatus(workflowStatusInternal, retries);
+    var initResult =
+        connection == null
+            ? systemDatabase.initWorkflowStatus(workflowStatusInternal, retries)
+            : systemDatabase.initWorkflowStatus(connection, workflowStatusInternal, retries);
 
     if (parentWorkflow != null) {
       systemDatabase.recordChildWorkflow(

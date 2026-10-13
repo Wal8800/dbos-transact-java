@@ -880,6 +880,33 @@ public class SystemDatabase implements AutoCloseable {
   }
 
   /**
+   * As {@link #initWorkflowStatus(WorkflowStatusInternal, Integer)}, but on a connection whose
+   * transaction the caller owns. Never commits, rolls back or retries, since on Postgres a failure
+   * has already aborted that transaction, and never evicts this database's pool.
+   *
+   * @throws IllegalArgumentException if {@code conn} is in autocommit mode, which would commit the
+   *     status and input rows apart
+   */
+  public WorkflowInitResult initWorkflowStatus(
+      Connection conn, WorkflowStatusInternal initStatus, @Nullable Integer maxRetries) {
+    if (closed.get()) {
+      throw new IllegalStateException("SystemDatabase is closed");
+    }
+    String ownerXid = UUID.randomUUID().toString();
+    Long delayUntilEpochMs = resolveDelayUntil(initStatus);
+    try {
+      if (conn.getAutoCommit()) {
+        throw new IllegalArgumentException(
+            "connection is in autocommit mode: open a transaction on it first");
+      }
+      return WorkflowDAO.initWorkflowStatus(
+          ctx, conn, initStatus, delayUntilEpochMs, maxRetries, ownerXid);
+    } catch (SQLException e) {
+      throw new DBOSSystemDatabaseException(e);
+    }
+  }
+
+  /**
    * The absolute end of a relative delay, counted from this JVM's clock, as Python and TypeScript
    * count it from their process's. Resolved once, outside the write's retry loop: resolved inside
    * it, every retry would push the delay later by that attempt's backoff.

@@ -35,6 +35,7 @@ import dev.dbos.transact.workflow.WorkflowSchedule;
 import dev.dbos.transact.workflow.WorkflowStatus;
 import dev.dbos.transact.workflow.internal.InternalWorkflows;
 
+import java.sql.Connection;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
@@ -1058,17 +1059,68 @@ public class DBOSClient implements AutoCloseable {
   }
 
   /**
-   * Every public enqueue lands here. {@code serializationFormat} is for the deprecated overloads,
-   * which name a format directly; when it is null the format comes from {@code
-   * options.serialization()}. Naming a format that contradicts the options' is refused rather than
-   * letting one silently win; {@link SerializationStrategy#DEFAULT} names no format, so it
-   * contradicts nothing.
+   * Enqueue a workflow in a transaction the caller owns, so it commits or rolls back with the
+   * caller's own writes. DBOS never commits, rolls back or retries on {@code connection}. A failed
+   * enqueue, such as a deduplication clash, aborts a Postgres transaction: roll it back.
+   *
+   * @param <T> Return type of workflow function
+   * @param <E> Exception thrown by workflow function
+   * @param connection A connection to the system database, with a transaction open
+   * @param options {@link dev.dbos.transact.EnqueueOptions} for enqueuing the workflow
+   * @param args Arguments to pass to the workflow function
+   * @return WorkflowHandle for the workflow, valid once the caller commits
+   * @throws IllegalArgumentException if {@code connection} is in autocommit mode
    */
+  public <T, E extends Exception> @NonNull WorkflowHandle<T, E> enqueueWorkflowInTransaction(
+      @NonNull Connection connection,
+      dev.dbos.transact.@NonNull EnqueueOptions options,
+      @Nullable Object[] args) {
+    return enqueueWorkflowInTransaction(connection, options, args, null);
+  }
+
+  /**
+   * As {@link #enqueueWorkflowInTransaction(Connection, dev.dbos.transact.EnqueueOptions,
+   * Object[])}, with named as well as positional arguments.
+   *
+   * @param <T> Return type of workflow function
+   * @param <E> Exception thrown by workflow function
+   * @param connection A connection to the system database, with a transaction open
+   * @param options {@link dev.dbos.transact.EnqueueOptions} for enqueuing the workflow
+   * @param positionalArgs Positional arguments to pass to the workflow function
+   * @param namedArgs Named arguments to pass to the workflow function (e.g., for Python kwargs)
+   * @return WorkflowHandle for the workflow, valid once the caller commits
+   * @throws IllegalArgumentException if {@code connection} is in autocommit mode
+   */
+  public <T, E extends Exception> @NonNull WorkflowHandle<T, E> enqueueWorkflowInTransaction(
+      @NonNull Connection connection,
+      dev.dbos.transact.@NonNull EnqueueOptions options,
+      @Nullable Object[] positionalArgs,
+      @Nullable Map<String, Object> namedArgs) {
+    Objects.requireNonNull(connection, "connection must not be null");
+    return enqueueWorkflowInternal(options, positionalArgs, namedArgs, null, connection);
+  }
+
   private <T, E extends Exception> WorkflowHandle<T, E> enqueueWorkflowInternal(
       dev.dbos.transact.EnqueueOptions options,
       @Nullable Object[] positionalArgs,
       @Nullable Map<String, Object> namedArgs,
       @Nullable String serializationFormat) {
+    return enqueueWorkflowInternal(options, positionalArgs, namedArgs, serializationFormat, null);
+  }
+
+  /**
+   * Every public enqueue lands here. {@code serializationFormat} is for the deprecated overloads,
+   * which name a format directly; when it is null the format comes from {@code
+   * options.serialization()}. Naming a format that contradicts the options' is refused rather than
+   * letting one silently win; {@link SerializationStrategy#DEFAULT} names no format, so it
+   * contradicts nothing. A non-null {@code connection} enqueues in the caller's transaction.
+   */
+  private <T, E extends Exception> WorkflowHandle<T, E> enqueueWorkflowInternal(
+      dev.dbos.transact.EnqueueOptions options,
+      @Nullable Object[] positionalArgs,
+      @Nullable Map<String, Object> namedArgs,
+      @Nullable String serializationFormat,
+      @Nullable Connection connection) {
 
     Objects.requireNonNull(options, "options must not be null");
 
@@ -1101,7 +1153,8 @@ public class DBOSClient implements AutoCloseable {
         null,
         null,
         options.applicationName(),
-        systemDatabase);
+        systemDatabase,
+        connection);
 
     return new WorkflowHandleClient<>(workflowId);
   }

@@ -163,8 +163,6 @@ public class WorkflowDAO {
       String ownerXid)
       throws SQLException {
 
-    logger.debug("initWorkflowStatus workflowId {}", initStatus.workflowId());
-
     try (var conn = ctx.getConnection()) {
 
       boolean shouldCommit = false;
@@ -173,53 +171,11 @@ public class WorkflowDAO {
         conn.setAutoCommit(false);
         conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
 
-        InsertWorkflowResult resRow =
-            insertWorkflowStatus(
-                conn,
-                ctx.schema(),
-                initStatus,
-                delayUntilEpochMs,
-                ownerXid,
-                owner(ctx, initStatus));
+        var result =
+            initWorkflowStatus(ctx, conn, initStatus, delayUntilEpochMs, maxRetries, ownerXid);
+        shouldCommit = result.shouldExecuteOnThisExecutor();
 
-        if (!Objects.equals(resRow.workflowName(), initStatus.workflowName())) {
-          String msg =
-              String.format(
-                  "Workflow already exists with a different function name: %s, but the provided function name is: %s",
-                  resRow.workflowName(), initStatus.workflowName());
-          throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
-        } else if (!Objects.equals(resRow.className(), initStatus.className())) {
-          String msg =
-              String.format(
-                  "Workflow already exists with a different class name: %s, but the provided class name is: %s",
-                  resRow.className(), initStatus.className());
-          throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
-        } else if (!Objects.equals(
-            resRow.instanceName() != null ? resRow.instanceName() : "",
-            initStatus.instanceName() != null ? initStatus.instanceName() : "")) {
-          String msg =
-              String.format(
-                  "Workflow already exists with a different class configuration: %s, but the provided class configuration is: %s",
-                  resRow.instanceName(), initStatus.instanceName());
-          throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
-        }
-
-        var state = resRow.status;
-
-        // Only the first writer of a row owns its execution. A caller that finds someone else's
-        // row polls for the outcome instead, and one that finds a dead-lettered row is told so.
-        if (!ownerXid.equals(resRow.ownerXid)) {
-          if (resRow.status == WorkflowState.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
-            throw new DBOSMaxRecoveryAttemptsExceededException(
-                initStatus.workflowId(),
-                Objects.requireNonNullElse(maxRetries, Constants.DEFAULT_MAX_RECOVERY_ATTEMPTS));
-          }
-          return new WorkflowInitResult(state, resRow.deadline(), false, resRow.serialization());
-        }
-
-        shouldCommit = true;
-
-        return new WorkflowInitResult(state, resRow.deadline(), true, resRow.serialization());
+        return result;
 
       } finally {
         if (shouldCommit) {
@@ -230,6 +186,64 @@ public class WorkflowDAO {
         DebugTriggers.debugTriggerPoint(DebugTriggers.DEBUG_TRIGGER_INITWF_COMMIT);
       }
     } // end try with resources connection closed
+  }
+
+  /**
+   * As {@link #initWorkflowStatus(DbContext, WorkflowStatusInternal, Long, Integer, String)},
+   * inside whatever transaction {@code conn} has open. Never sets autocommit or isolation, and
+   * never commits or rolls back.
+   */
+  public static WorkflowInitResult initWorkflowStatus(
+      DbContext ctx,
+      Connection conn,
+      WorkflowStatusInternal initStatus,
+      @Nullable Long delayUntilEpochMs,
+      @Nullable Integer maxRetries,
+      String ownerXid)
+      throws SQLException {
+
+    logger.debug("initWorkflowStatus workflowId {}", initStatus.workflowId());
+
+    InsertWorkflowResult resRow =
+        insertWorkflowStatus(
+            conn, ctx.schema(), initStatus, delayUntilEpochMs, ownerXid, owner(ctx, initStatus));
+
+    if (!Objects.equals(resRow.workflowName(), initStatus.workflowName())) {
+      String msg =
+          String.format(
+              "Workflow already exists with a different function name: %s, but the provided function name is: %s",
+              resRow.workflowName(), initStatus.workflowName());
+      throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
+    } else if (!Objects.equals(resRow.className(), initStatus.className())) {
+      String msg =
+          String.format(
+              "Workflow already exists with a different class name: %s, but the provided class name is: %s",
+              resRow.className(), initStatus.className());
+      throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
+    } else if (!Objects.equals(
+        resRow.instanceName() != null ? resRow.instanceName() : "",
+        initStatus.instanceName() != null ? initStatus.instanceName() : "")) {
+      String msg =
+          String.format(
+              "Workflow already exists with a different class configuration: %s, but the provided class configuration is: %s",
+              resRow.instanceName(), initStatus.instanceName());
+      throw new DBOSConflictingWorkflowException(initStatus.workflowId(), msg);
+    }
+
+    var state = resRow.status;
+
+    // Only the first writer of a row owns its execution. A caller that finds someone else's
+    // row polls for the outcome instead, and one that finds a dead-lettered row is told so.
+    if (!ownerXid.equals(resRow.ownerXid)) {
+      if (resRow.status == WorkflowState.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
+        throw new DBOSMaxRecoveryAttemptsExceededException(
+            initStatus.workflowId(),
+            Objects.requireNonNullElse(maxRetries, Constants.DEFAULT_MAX_RECOVERY_ATTEMPTS));
+      }
+      return new WorkflowInitResult(state, resRow.deadline(), false, resRow.serialization());
+    }
+
+    return new WorkflowInitResult(state, resRow.deadline(), true, resRow.serialization());
   }
 
   /**
